@@ -1,0 +1,5 @@
+/home/kira/ns-allinone-3.39/ns-3.39/scratch/scratch-simulator.cc
+/home/kira/ns-allinone-3.39/ns-3.39/scratch/nested-subdir/scratch-nested-subdir-executable.cc
+/home/kira/ns-allinone-3.39/ns-3.39/scratch/nested-subdir/lib/scratch-nested-subdir-library-source.cc
+/home/kira/ns-allinone-3.39/ns-3.39/scratch/subdir/scratch-subdir-additional-header.cc
+/home/kira/ns-allinone-3.39/ns-3.39/scratch/subdir/scratch-subdir.cc
