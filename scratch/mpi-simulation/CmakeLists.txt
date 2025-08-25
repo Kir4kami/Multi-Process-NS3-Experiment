@@ -1,0 +1,11 @@
+build_exec(
+    EXECNAME cut-mpi
+    EXECNAME_PREFIX scratch_
+    SOURCE_FILES 
+        cut-mpi.cc
+        mpi-log.cc
+        mpi-test-fixtures.cc
+    LIBRARIES_TO_LINK 
+        "${ns3-libs}" 
+        "${ns3-contrib-libs}"
+)
