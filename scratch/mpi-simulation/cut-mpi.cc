@@ -430,7 +430,7 @@ int main(int argc, char* argv[]){
     }
 
     RANK0COUT("topo Created"<<std::endl);
-    rank0log("拓扑创建完毕 拓扑规模:"+ std::to_string(LEAF*SPINE)+" 进程分配:"+std::to_string(DST));
+    rank0log("拓扑创建完毕 拓扑规模:"+ std::to_string(LEAF*SERVER)+" 进程分配:"+std::to_string(DST));
     MPI_Barrier(MPI_COMM_WORLD);
     workLoad();
     RANK0COUT("workload Created"<<std::endl);
