@@ -19,9 +19,12 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <ctime>
 
 using namespace ns3;
-
 
 std::map<uint16_t, double> phaseStartTimes;
 
@@ -59,7 +62,7 @@ uint16_t SERVER=8;
 uint16_t DST=2; //进程数
 std::vector<NodeContainer> serverNodes;
 std::vector<Ipv4InterfaceContainer> serverInterfaces;
-uint32_t packets=0;
+
 struct FlowInfo{//流量信息结构体
     char type[32];
     uint32_t srcNodeId;
@@ -69,176 +72,181 @@ struct FlowInfo{//流量信息结构体
     uint8_t priority;
     uint64_t msgLen;
 };
-std::vector<std::vector<FlowInfo>> flowInfos;
-u_int16_t BatchCur=0;
-u_int32_t flowCom=0;
-void flowRx_cb(const ns3::Ptr<const ns3::Packet> packet,
-                    const ns3::Address& srcAddress,
-                    const ns3::Address& destAddress);
-void LoadWait();
 
-void CreateFlow(const FlowInfo& flow, double startTime){//跨进程流量创建(单条)
-    ApplicationContainer apps;
-    // 获取系统进程ID
-    uint32_t systemId = MpiInterface::GetSystemId();
-    // 源节点和目标节点所在的进程
-    uint32_t srcSystemId = flow.srcNodeId / (SERVER*LEAF/DST);
-    uint32_t dstSystemId = flow.dstNodeId / (SERVER*LEAF/DST);
-    uint16_t srcLeaf = flow.srcNodeId / SERVER;
-    uint16_t dstLeaf = flow.dstNodeId / SERVER;
-    uint16_t srcServer = flow.srcNodeId % SERVER;
-    uint16_t dstServer = flow.dstNodeId % SERVER;
-    bool send = false;
-    bool recv = false;
-    // 发送端配置（仅在源节点所在进程创建）
-    if (systemId == srcSystemId) {
-        OnOffHelper clientHelper("ns3::UdpSocketFactory", Address());
-        clientHelper.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
-        clientHelper.SetAttribute("OffTime",StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-        clientHelper.SetAttribute("MaxBytes", UintegerValue(flow.msgLen));
-        AddressValue remoteAddress(InetSocketAddress(
-            serverInterfaces[dstLeaf].GetAddress(dstServer), flow.dstPort));
-        clientHelper.SetAttribute("Remote", remoteAddress);
-        apps.Add(clientHelper.Install(serverNodes[srcLeaf].Get(srcServer)));
-        send=true;
-        // logMessage("流量发送 源节点 "+std::to_string(flow.srcNodeId)+" 目标节点 "+ 
-                // std::to_string(flow.dstNodeId)+" 流量大小 "+std::to_string(flow.msgLen));
-    }
-    // 接收端配置（仅在目标节点所在进程创建）
-    if (systemId == dstSystemId) {
-        // 创建PacketSink
-        PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
-                             InetSocketAddress(Ipv4Address::GetAny(), flow.dstPort));
-        auto apps = sinkHelper.Install(serverNodes[dstLeaf].Get(dstServer));
-        auto sink = DynamicCast<PacketSink>(apps.Get(0));
-        NS_ASSERT_MSG(sink, "Couldn't get PacketSink application.");
-        sink->TraceConnectWithoutContext("RxWithAddresses",
-                                            MakeCallback(&SinkTracer::SinkTrace));
-        sink->TraceConnectWithoutContext("RxWithAddresses",
-                                            MakeCallback(flowRx_cb));
-        recv=true;
-    }   
-    apps.Start(Seconds(0));
-    apps.Stop(Seconds(100000));
-    if(send&&recv)
-        std::cout << " from " << flow.srcNodeId << " to " << flow.dstNodeId <<
-                " fromportNumber " << 1 <<
-                " destportNumder " << 1 <<
-                " time " << Simulator::Now().GetSeconds() << " flowsize "<< flow.msgLen << std::endl;
-}
-
-void LoadFlow(double startTime = 0){//加载当前的一个phase  
-    phaseStartTimes[BatchCur] = Simulator::Now().GetSeconds();
-    for(FlowInfo flow:flowInfos[BatchCur]){
-        CreateFlow(flow,startTime);
-        if(MpiInterface::GetSystemId()==(flow.dstNodeId / (SERVER*LEAF/DST)))
-            packets+=(flow.msgLen/1448+((flow.msgLen%1448)>0?1:0));
-    }
-    if(packets==0)
-        LoadWait();
-}
-
-void LoadWait(){
-    uint32_t localDone = 1;
-    // MPI全局归约操作检测所有进程完成状态
-    uint32_t globalDone = 0;
-    MPI_Allreduce(&localDone, &globalDone, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    // 只有所有进程都完成时才进入下一阶段
-    if(globalDone == MpiInterface::GetSize()){
-        double phaseEndTime = Simulator::Now().GetSeconds();
-        double phaseStartTime = phaseStartTimes[BatchCur];
-        double phaseDuration = phaseEndTime - phaseStartTime;
-        rank0log("phase "+std::to_string(BatchCur)+" 完成, FCT: "+std::to_string(phaseDuration)+" 秒");
-        RANK0COUT("All flows completed in phase " << BatchCur << std::endl);
-        // 停止当前仿真
-        Simulator::Stop();
-        // 准备下一阶段
-        BatchCur++;
-        if(BatchCur < flowInfos.size()){
-            // 重置计数器
-            flowCom = 0;
-            packets = 0;
-            // 加载新流量（需同步）
-            MPI_Barrier(MPI_COMM_WORLD);
-            if(MpiInterface::GetSystemId() == 0)
-                RANK0COUT("Loading phase " << BatchCur << std::endl);
-            // 各进程并行加载
-            LoadFlow();
-            // 全局同步确保所有进程加载完成
-            MPI_Barrier(MPI_COMM_WORLD);
-            // 重启仿真
-            Simulator::Run();
-        }
-        else
-            RANK0COUT("All phases completed" << std::endl);
-    }
-}
-void flowRx_cb(const ns3::Ptr<const ns3::Packet> packet,
-                    const ns3::Address& srcAddress,
-                    const ns3::Address& destAddress){
-    flowCom++;
-    
-    // logMessage("phase " + std::to_string(BatchCur) + " 源地址" + SinkTracer::FormatAddress(srcAddress) + " " +
-    //            "目的地址"+SinkTracer::FormatAddress(destAddress) + " " +
-    //            "数据包大小"+std::to_string(packet->GetSize()));
-    //std::cout<<"rank "<<MpiInterface::GetSystemId() <<" phase "<<BatchCur<<" flow "<< flowCom<<" "<<Simulator::Now().GetSeconds()<<std::endl;
-    
-    if(flowCom >= packets)
-        LoadWait();
-}
-
-void workLoad (){
-    std::ifstream flowInput;
-    flowInput.open("scratch/rdma_operate.txt");
-    if (!flowInput.is_open())
-        std::cout << "unable to open flowInputFile!" << std::endl;
-    RANK0COUT("Reading flow info"<< std::endl);
-    std::string line;
+struct OperateState {
+    std::vector<std::vector<FlowInfo>> phases;
+    int curPhase = 0;
+    uint32_t flowCom = 0;
+    uint32_t packets = 0;
+    bool finished = false;
     double startTime = 0;
-    int batch = -1;
-    while (std::getline(flowInput, line)) {
-        if (line.empty() || line[0] == '#' || line.find("stat")!=std::string::npos) continue;
-        std::stringstream ss(line);
-        std::string  type_str;
-        if (line.find("phase")!=std::string::npos){//phase
-            double phase;
-            ss >> type_str >> phase;
-            if(batch < 0)
-                startTime += phase/1e6;
-            batch ++;
-            flowInfos.emplace_back(std::vector<FlowInfo> {});
-            continue;//to be changed
+    double mpiSyncTime = 0; // 累计MPI同步耗时
+};
+std::vector<OperateState> allOperates;
+
+void flowRx_cb(int fileIdx, const ns3::Ptr<const ns3::Packet> packet,
+               const ns3::Address& srcAddress, const ns3::Address& destAddress);
+
+// 多个operate文件自动加载
+void workLoad(int operateNum) {
+    allOperates.clear();
+    for (int idx = 0; idx < operateNum; ++idx) {
+        std::string fileName = "scratch/rdma_operate" + std::to_string(idx) + ".txt";
+        OperateState op;
+        std::ifstream flowInput(fileName);
+        if (!flowInput.is_open()) {
+            std::cout << "unable to open flowInputFile: " << fileName << std::endl;
+            continue;
         }
-        FlowInfo flow;
-        ss >> type_str >> flow.type;
-        ss >> type_str >> flow.srcNodeId;
-        ss >> type_str >> flow.srcPort;
-        ss >> type_str >> flow.dstNodeId;
-        ss >> type_str >> flow.dstPort;
-        ss >> type_str >> flow.priority;
-        ss >> type_str >> flow.msgLen;
-        flow.dstPort = batch + 1;
-        flowInfos[batch].emplace_back(flow);
+        std::string line;
+        int batch = -1;
+        double startTime = 0;
+        while (std::getline(flowInput, line)) {
+            if (line.empty() || line[0] == '#' || line.find("stat")!=std::string::npos) continue;
+            std::stringstream ss(line);
+            std::string type_str;
+            if (line.find("phase")!=std::string::npos) {
+                double phase;
+                ss >> type_str >> phase;
+                if(batch < 0)
+                    startTime += phase/1e6;
+                batch ++;
+                op.phases.emplace_back(std::vector<FlowInfo> {});
+                continue;
+            }
+            FlowInfo flow;
+            ss >> type_str >> flow.type;
+            ss >> type_str >> flow.srcNodeId;
+            ss >> type_str >> flow.srcPort;
+            ss >> type_str >> flow.dstNodeId;
+            ss >> type_str >> flow.dstPort;
+            ss >> type_str >> flow.priority;
+            ss >> type_str >> flow.msgLen;
+            flow.dstPort = batch + 1;
+            op.phases[batch].emplace_back(flow);
+        }
+        op.startTime = startTime;
+        flowInput.close();
+        allOperates.emplace_back(op);
     }
-    LoadFlow(startTime);
-    flowInput.close();
+}
+
+// 独立加载每个operate的当前phase
+void LoadPhase(int fileIdx) {
+    OperateState& op = allOperates[fileIdx];
+    op.flowCom = 0;
+    op.packets = 0;
+    if (op.curPhase >= op.phases.size()) {
+        op.finished = true;
+        return;
+    }
+    phaseStartTimes[fileIdx*1000 + op.curPhase] = Simulator::Now().GetSeconds();
+    for (const auto& flow : op.phases[op.curPhase]) {
+        // 这里可以加fileIdx参数区分流量归属
+        uint32_t systemId = MpiInterface::GetSystemId();
+        uint32_t srcSystemId = flow.srcNodeId / (SERVER*LEAF/DST);
+        uint32_t dstSystemId = flow.dstNodeId / (SERVER*LEAF/DST);
+        uint16_t srcLeaf = flow.srcNodeId / SERVER;
+        uint16_t dstLeaf = flow.dstNodeId / SERVER;
+        uint16_t srcServer = flow.srcNodeId % SERVER;
+        uint16_t dstServer = flow.dstNodeId % SERVER;
+        bool send = false;
+        bool recv = false;
+        if (systemId == srcSystemId) {
+            OnOffHelper clientHelper("ns3::UdpSocketFactory", Address());
+            clientHelper.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
+            clientHelper.SetAttribute("OffTime",StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+            clientHelper.SetAttribute("MaxBytes", UintegerValue(flow.msgLen));
+            AddressValue remoteAddress(InetSocketAddress(
+                serverInterfaces[dstLeaf].GetAddress(dstServer), flow.dstPort));
+            clientHelper.SetAttribute("Remote", remoteAddress);
+            ApplicationContainer apps = clientHelper.Install(serverNodes[srcLeaf].Get(srcServer));
+            send=true;
+            apps.Start(Seconds(0));
+            apps.Stop(Seconds(100000));
+        }
+        if (systemId == dstSystemId) {
+            PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
+                                 InetSocketAddress(Ipv4Address::GetAny(), flow.dstPort));
+            auto apps = sinkHelper.Install(serverNodes[dstLeaf].Get(dstServer));
+            auto sink = DynamicCast<PacketSink>(apps.Get(0));
+            NS_ASSERT_MSG(sink, "Couldn't get PacketSink application.");
+            // 这里用MakeBoundCallback传递fileIdx
+            sink->TraceConnectWithoutContext("RxWithAddresses",
+                MakeBoundCallback(&flowRx_cb, fileIdx));
+            apps.Start(Seconds(0));
+            apps.Stop(Seconds(100000));
+            recv=true;
+        }
+        if (systemId == dstSystemId)
+            op.packets += (flow.msgLen/1448 + ((flow.msgLen%1448)>0?1:0));
+    }
+    if(op.packets == 0) {
+        op.curPhase++;
+        LoadPhase(fileIdx);
+    }
+}
+
+// 回调函数，带fileIdx参数
+void flowRx_cb(int fileIdx, const ns3::Ptr<const ns3::Packet> packet,
+               const ns3::Address& srcAddress, const ns3::Address& destAddress) {
+    OperateState& op = allOperates[fileIdx];
+    op.flowCom++;
+    if (op.flowCom >= op.packets) {
+        uint32_t localDone = 1, globalDone = 0;
+        // 真实世界时间统计
+        auto syncStart = std::chrono::high_resolution_clock::now();
+        MPI_Allreduce(&localDone, &globalDone, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        auto syncEnd = std::chrono::high_resolution_clock::now();
+        op.mpiSyncTime += std::chrono::duration<double>(syncEnd - syncStart).count(); // 累加真实同步耗时
+        if (globalDone == MpiInterface::GetSize()) {
+            double phaseEndTime = Simulator::Now().GetSeconds();
+            double phaseStartTime = phaseStartTimes[fileIdx*1000 + op.curPhase];
+            double phaseDuration = phaseEndTime - phaseStartTime;
+            logMessage("operate"+std::to_string(fileIdx)+" phase "+std::to_string(op.curPhase)+
+                " FCT: "+std::to_string(phaseDuration)+" 秒, MPI同步累计: "+std::to_string(op.mpiSyncTime)+" 秒");
+            RANK0COUT("operate " << fileIdx << " phase " << op.curPhase << " completed. MPI同步累计: " << op.mpiSyncTime << " 秒" << std::endl);
+            Simulator::Stop();
+            op.curPhase++;
+            if(op.curPhase < op.phases.size()){
+                op.flowCom = 0;
+                op.packets = 0;
+                // Barrier真实时间统计
+                auto barrierStart = std::chrono::high_resolution_clock::now();
+                MPI_Barrier(MPI_COMM_WORLD);
+                auto barrierEnd = std::chrono::high_resolution_clock::now();
+                op.mpiSyncTime += std::chrono::duration<double>(barrierEnd - barrierStart).count();
+                if(MpiInterface::GetSystemId() == 0)
+                    RANK0COUT("Loading operate " << fileIdx << " phase " << op.curPhase << std::endl);
+                LoadPhase(fileIdx);
+                barrierStart = std::chrono::high_resolution_clock::now();
+                MPI_Barrier(MPI_COMM_WORLD);
+                barrierEnd = std::chrono::high_resolution_clock::now();
+                op.mpiSyncTime += std::chrono::duration<double>(barrierEnd - barrierStart).count();
+                Simulator::Run();
+            } else {
+                op.finished = true;
+                RANK0COUT("operate " << fileIdx << " all phases completed. MPI同步累计: " << op.mpiSyncTime << " 秒" << std::endl);
+            }
+        }
+    }
 }
 
 int main(int argc, char* argv[]){
     bool nix = true;
     bool tracing = false;
     uint8_t topo_select=1;
-    // Parse command line
+    int operateNum = 8;
     CommandLine cmd(__FILE__);
     cmd.AddValue("nix", "Enable the use of nix-vector or global routing", nix);
     cmd.AddValue("tracing", "Enable pcap tracing", tracing);
     cmd.AddValue("topo", "topo select", topo_select);
+    cmd.AddValue("operateNum", "Number of operate files", operateNum);
     cmd.Parse(argc, argv);
 
     SPINE=topo[topo_select][0];
     LEAF=topo[topo_select][1];
     SERVER=topo[topo_select][2];
-    // Distributed simulation setup; by default use granted time window algorithm.
     GlobalValue::Bind("SimulatorImplementationType",StringValue("ns3::DistributedSimulatorImpl"));
 
     MpiInterface::Enable(&argc, &argv);
@@ -248,7 +256,6 @@ int main(int argc, char* argv[]){
     auto worldRank = SinkTracer::GetWorldRank();
     g_worldRank = worldRank;
     DST=worldSize;
-    // 初始化日志文件
     std::string logFileName = "scratch/LOG_cut-mpi.log";
     g_logFile.open(logFileName, std::ios::app);
     if (!g_logFile.is_open()) {
@@ -258,11 +265,8 @@ int main(int argc, char* argv[]){
     rank0log("log start");
 
     bool freeComm = false;
-    // The new communicator, if we create one
     MPI_Comm splitComm = MPI_COMM_WORLD;
-    // The list of ranks assigned to ns-3
     std::string ns3Ranks;
-    // Tag for whether this rank should go into a new communicator
     int color = MPI_UNDEFINED;
 
     if (worldSize == DST){
@@ -274,9 +278,6 @@ int main(int argc, char* argv[]){
         freeComm = false;
     }
     else{
-        //  worldSize > 2    communicator of ranks 1-2
-
-        // Put ranks 1-2 in the new communicator
         if (worldRank < DST )
             color = NS_COLOR;
         else
@@ -284,12 +285,10 @@ int main(int argc, char* argv[]){
         std::stringstream ss;
         ss << "Split [1-2] (out of " << worldSize << " ranks) from MPI_COMM_WORLD";
         ns3Ranks = ss.str();
-        // Now create the new communicator
         MPI_Comm_split(MPI_COMM_WORLD, color, worldRank, &splitComm);
         freeComm = true;
     }
 
-    // Report the configuration from rank 0 only
     RANK0COUT(cmd.GetName() << "\n");
     RANK0COUT("\n");
     RANK0COUT("Configuration:\n");
@@ -310,25 +309,19 @@ int main(int argc, char* argv[]){
         return 0;
     }
     uint32_t systemId = MpiInterface::GetSystemId();
-    //uint32_t systemCount = MpiInterface::GetSize();
-    // 默认UDP流量设置
     Config::SetDefault("ns3::OnOffApplication::PacketSize", UintegerValue(1448));
     Config::SetDefault("ns3::OnOffApplication::DataRate", StringValue("2Mbps"));
     Config::SetDefault("ns3::OnOffApplication::MaxBytes", UintegerValue(1448));
 
-    //接下来要在不同进程下根据拓扑配置创建节点
-    //那么首先要分配节点给不同的进程
-    uint16_t leafP=LEAF/DST;//一个进程有几个leaf
-    double spineP=(double)SPINE/DST;//一个进程有几个spine
-    //首先创建服务器节点
+    uint16_t leafP=LEAF/DST;
+    double spineP=(double)SPINE/DST;
     serverNodes.resize(LEAF);
     for(uint16_t i=0;i<LEAF;i++){
         serverNodes[i].Create(SERVER, i/leafP);
         if(systemId==i/leafP)
             std::cout<<"process:" << systemId << " Create server nodes:" << serverNodes[i].GetN() << std::endl;
     }
-    NodeContainer routerNodes;//记录所有交换机节点 spine + leaf
-    //然后创建leaf节点
+    NodeContainer routerNodes;
     std::vector<Ptr<Node>> leafNodes(LEAF);
     for(uint16_t i=0;i<LEAF;i++){
         leafNodes[i]=CreateObject<Node>(i/leafP);
@@ -336,7 +329,6 @@ int main(int argc, char* argv[]){
             std::cout<<"process:" << systemId << " Create a leaf node id:" << leafNodes[i]->GetId() << std::endl;
         routerNodes.Add(leafNodes[i]);
     }
-    //然后创建spine节点
     std::vector<Ptr<Node>> spineNodes(SPINE);
     for(uint16_t i=0;i<SPINE;i++){
         spineNodes[i]=CreateObject<Node>((uint16_t)(i/spineP));
@@ -345,8 +337,6 @@ int main(int argc, char* argv[]){
         routerNodes.Add(spineNodes[i]);
     }
 
-    //那么接下来要创建链路了
-    //首先创建server到leaf的链路
     PointToPointHelper leafLink;
     leafLink.SetDeviceAttribute("DataRate", StringValue("25Mbps"));
     leafLink.SetChannelAttribute("Delay", StringValue("2us"));
@@ -360,7 +350,6 @@ int main(int argc, char* argv[]){
         }
     }
     
-    //然后创建leaf到spine的链路
     PointToPointHelper spineLink;
     spineLink.SetDeviceAttribute("DataRate", StringValue("25Mbps"));
     spineLink.SetChannelAttribute("Delay", StringValue("2us"));
@@ -379,12 +368,12 @@ int main(int argc, char* argv[]){
     list.Add(nixRouting, 10);
 
     if (nix)
-        stack.SetRoutingHelper(list); // has effect on the next Install ()
+        stack.SetRoutingHelper(list);
 
     stack.InstallAll();
 
     Ipv4InterfaceContainer routerInterfaces;
-     serverInterfaces.resize(LEAF);
+    serverInterfaces.resize(LEAF);
     std::vector<Ipv4InterfaceContainer> leafInterfaces(LEAF);
     std::vector<Ipv4AddressHelper> serverAddresses(LEAF);
     Ipv4AddressHelper routerAddress;
@@ -394,11 +383,7 @@ int main(int argc, char* argv[]){
         serverAddresses[i].SetBase(address.c_str(), "255.255.255.0");
     }
     routerAddress.SetBase("10.0.1.0", "255.255.255.0");
-    //交换机链路 interfaces
     std::vector<Ipv4InterfaceContainer> switchInterfaces(LEAF*SPINE);
-    // for(int i=0;i<LEAF*SPINE;i++){
-    //     switchInterfaces[i] = routerAddress.Assign(spineToLeaf[i]);
-    // }
     for(int i=0; i<LEAF*SPINE; i++){
         uint16_t spineId = i / LEAF;
         uint16_t leafId = i % LEAF;
@@ -410,8 +395,6 @@ int main(int argc, char* argv[]){
         switchInterfaces[i] = linkAddress.Assign(spineToLeaf[i]);
     }
 
-
-    //服务器链路interfaces
     for(uint16_t i=0;i<LEAF;i++){
         for(uint16_t j=0;j<SERVER;j++){
             NetDeviceContainer ndc;
@@ -432,22 +415,36 @@ int main(int argc, char* argv[]){
     RANK0COUT("topo Created"<<std::endl);
     rank0log("拓扑创建完毕 拓扑规模:"+ std::to_string(LEAF*SERVER)+" 进程分配:"+std::to_string(DST));
     MPI_Barrier(MPI_COMM_WORLD);
-    workLoad();
+    workLoad(operateNum);
     RANK0COUT("workload Created"<<std::endl);
     MPI_Barrier(MPI_COMM_WORLD);
     rank0log("流量加载完毕");
+
     Simulator::Stop(Seconds(100000));
     auto start = std::chrono::high_resolution_clock::now();
+
+    // 启动所有operate的第一个phase
+    for (int i = 0; i < allOperates.size(); ++i) {
+        if (!allOperates[i].finished) {
+            LoadPhase(i);
+        }
+    }
     Simulator::Run();
     Simulator::Destroy();
+
     if (freeComm)
         MPI_Comm_free(&splitComm);
     SinkTracer::Verify();
     MpiInterface::Disable();
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    rank0log("耗时: " + std::to_string(duration.count() / 1000000.0) + " 秒");
-    // 关闭日志文件
+    double totalSimTime = duration.count() / 1000000.0;
+    double totalSyncTime = 0;
+    for (const auto& op : allOperates) {
+        totalSyncTime += op.mpiSyncTime;
+    }
+    double syncRatio = totalSyncTime / totalSimTime;
+    rank0log("耗时: " + std::to_string(totalSimTime) + " 秒, MPI同步总耗时: " + std::to_string(totalSyncTime) + " 秒, 占比: " + std::to_string(syncRatio * 100) + "%");
     g_logFile.close();
     return 0;
 }
