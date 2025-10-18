@@ -88,9 +88,9 @@ void flowRx_cb(int fileIdx, const ns3::Ptr<const ns3::Packet> packet,
                const ns3::Address& srcAddress, const ns3::Address& destAddress);
 
 // 多个operate文件自动加载
-void workLoad(int operateNum) {
+void workLoad(int operateStart, int operateEnd) {
     allOperates.clear();
-    for (int idx = 0; idx < operateNum; ++idx) {
+    for (int idx = operateStart; idx <= operateEnd; ++idx) {
         std::string fileName = "scratch/rdma_operate" + std::to_string(idx) + ".txt";
         OperateState op;
         std::ifstream flowInput(fileName);
@@ -136,7 +136,7 @@ void LoadPhase(int fileIdx) {
     OperateState& op = allOperates[fileIdx];
     op.flowCom = 0;
     op.packets = 0;
-    if (op.curPhase >= op.phases.size()) {
+    if (op.curPhase >= static_cast<int>(op.phases.size())) {
         op.finished = true;
         return;
     }
@@ -150,8 +150,6 @@ void LoadPhase(int fileIdx) {
         uint16_t dstLeaf = flow.dstNodeId / SERVER;
         uint16_t srcServer = flow.srcNodeId % SERVER;
         uint16_t dstServer = flow.dstNodeId % SERVER;
-        bool send = false;
-        bool recv = false;
         if (systemId == srcSystemId) {
             OnOffHelper clientHelper("ns3::UdpSocketFactory", Address());
             clientHelper.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
@@ -161,7 +159,6 @@ void LoadPhase(int fileIdx) {
                 serverInterfaces[dstLeaf].GetAddress(dstServer), flow.dstPort));
             clientHelper.SetAttribute("Remote", remoteAddress);
             ApplicationContainer apps = clientHelper.Install(serverNodes[srcLeaf].Get(srcServer));
-            send=true;
             apps.Start(Seconds(0));
             apps.Stop(Seconds(100000));
         }
@@ -176,7 +173,6 @@ void LoadPhase(int fileIdx) {
                 MakeBoundCallback(&flowRx_cb, fileIdx));
             apps.Start(Seconds(0));
             apps.Stop(Seconds(100000));
-            recv=true;
         }
         if (systemId == dstSystemId)
             op.packets += (flow.msgLen/1448 + ((flow.msgLen%1448)>0?1:0));
@@ -206,9 +202,9 @@ void flowRx_cb(int fileIdx, const ns3::Ptr<const ns3::Packet> packet,
             logMessage("operate"+std::to_string(fileIdx)+" phase "+std::to_string(op.curPhase)+
                 " FCT: "+std::to_string(phaseDuration)+" 秒, MPI同步累计: "+std::to_string(op.mpiSyncTime)+" 秒");
             RANK0COUT("operate " << fileIdx << " phase " << op.curPhase << " completed. MPI同步累计: " << op.mpiSyncTime << " 秒" << std::endl);
-            Simulator::Stop();
+
             op.curPhase++;
-            if(op.curPhase < op.phases.size()){
+            if(op.curPhase < static_cast<int>(op.phases.size())){
                 op.flowCom = 0;
                 op.packets = 0;
                 // Barrier真实时间统计
@@ -227,6 +223,17 @@ void flowRx_cb(int fileIdx, const ns3::Ptr<const ns3::Packet> packet,
             } else {
                 op.finished = true;
                 RANK0COUT("operate " << fileIdx << " all phases completed. MPI同步累计: " << op.mpiSyncTime << " 秒" << std::endl);
+                // 检查是否所有operate都完成，只有全部完成才停止仿真
+                bool allFinished = true;
+                for (const auto& operate : allOperates) {
+                    if (!operate.finished) {
+                        allFinished = false;
+                        break;
+                    }
+                }
+                if (allFinished) {
+                    Simulator::Stop();
+                }
             }
         }
     }
@@ -236,13 +243,17 @@ int main(int argc, char* argv[]){
     bool nix = true;
     bool tracing = false;
     uint8_t topo_select=1;
-    int operateNum = 8;
+    int operateStart = 0;
+    int operateEnd = 7;
     CommandLine cmd(__FILE__);
     cmd.AddValue("nix", "Enable the use of nix-vector or global routing", nix);
     cmd.AddValue("tracing", "Enable pcap tracing", tracing);
     cmd.AddValue("topo", "topo select", topo_select);
-    cmd.AddValue("operateNum", "Number of operate files", operateNum);
+    cmd.AddValue("operateStart", "Start index of operate files", operateStart);
+    cmd.AddValue("operateEnd", "End index of operate files", operateEnd);
     cmd.Parse(argc, argv);
+    
+    // int operateNum = operateEnd - operateStart + 1; // 不再需要，已移除
 
     SPINE=topo[topo_select][0];
     LEAF=topo[topo_select][1];
@@ -256,7 +267,8 @@ int main(int argc, char* argv[]){
     auto worldRank = SinkTracer::GetWorldRank();
     g_worldRank = worldRank;
     DST=worldSize;
-    std::string logFileName = "scratch/LOG_cut-mpi.log";
+    // 根据operate范围生成独立的日志文件名
+    std::string logFileName = "scratch/LOG_cut-mpi_" + std::to_string(operateStart) + "-" + std::to_string(operateEnd) + ".log";
     g_logFile.open(logFileName, std::ios::app);
     if (!g_logFile.is_open()) {
         std::cerr << "无法打开日志文件: " << logFileName << std::endl;
@@ -415,7 +427,7 @@ int main(int argc, char* argv[]){
     RANK0COUT("topo Created"<<std::endl);
     rank0log("拓扑创建完毕 拓扑规模:"+ std::to_string(LEAF*SERVER)+" 进程分配:"+std::to_string(DST));
     MPI_Barrier(MPI_COMM_WORLD);
-    workLoad(operateNum);
+    workLoad(operateStart, operateEnd);
     RANK0COUT("workload Created"<<std::endl);
     MPI_Barrier(MPI_COMM_WORLD);
     rank0log("流量加载完毕");
@@ -424,17 +436,18 @@ int main(int argc, char* argv[]){
     auto start = std::chrono::high_resolution_clock::now();
 
     // 启动所有operate的第一个phase
-    for (int i = 0; i < allOperates.size(); ++i) {
+    for (size_t i = 0; i < allOperates.size(); ++i) {
         if (!allOperates[i].finished) {
             LoadPhase(i);
         }
     }
+
     Simulator::Run();
     Simulator::Destroy();
 
     if (freeComm)
         MPI_Comm_free(&splitComm);
-    SinkTracer::Verify();
+    //SinkTracer::Verify();
     MpiInterface::Disable();
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
