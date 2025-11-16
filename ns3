@@ -1219,6 +1219,29 @@ def run_step(args, target_to_run, target_args):
 
     if not args.dry_run:
         try:
+            # 检查是否需要CPU绑定（通过环境变量传递）
+            # NS3_CPU_SET: 格式为 "2,3" 表示该任务可用的CPU核心
+            # OMPI_COMM_WORLD_RANK: mpirun设置的MPI rank环境变量
+            cpu_set = os.environ.get("NS3_CPU_SET")
+            mpi_rank = os.environ.get("OMPI_COMM_WORLD_RANK")
+            
+            if cpu_set and mpi_rank is not None:
+                # 解析CPU集合和rank
+                try:
+                    cpu_list = [int(x.strip()) for x in cpu_set.split(",")]
+                    rank = int(mpi_rank)
+                    
+                    # 根据rank选择CPU核心（rank 0用第一个，rank 1用第二个，以此类推）
+                    if rank < len(cpu_list):
+                        selected_cpu = str(cpu_list[rank])
+                        # 使用taskset绑定CPU
+                        import shutil
+                        taskset_path = shutil.which("taskset")
+                        if taskset_path:
+                            program_arguments = [taskset_path, "-c", selected_cpu] + program_arguments
+                except (ValueError, IndexError):
+                    pass  # 如果解析失败，继续正常执行
+            
             subprocess.run(program_arguments, env=proc_env, cwd=working_dir, shell=use_shell, check=True)
         except subprocess.CalledProcessError as e:
             # Replace list of arguments with a single string

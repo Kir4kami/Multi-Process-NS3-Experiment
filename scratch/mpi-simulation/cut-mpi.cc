@@ -242,7 +242,7 @@ void flowRx_cb(int fileIdx, const ns3::Ptr<const ns3::Packet> packet,
 int main(int argc, char* argv[]){
     bool nix = true;
     bool tracing = false;
-    uint8_t topo_select=1;
+    uint8_t topo_select=1;  // 128拓扑
     int operateStart = 0;
     int operateEnd = 7;
     CommandLine cmd(__FILE__);
